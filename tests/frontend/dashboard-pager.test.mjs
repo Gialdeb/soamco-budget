@@ -199,6 +199,8 @@ function mount(items, reducedMotion = false, geometry = {}) {
                     label: 'Agenda',
                     fill: geometry.fill,
                     compactMobile: geometry.compactMobile,
+                    compactControls: geometry.compactControls,
+                    stableLayout: geometry.stableLayout,
                 },
                 {
                     default: ({ item }) =>
@@ -468,4 +470,30 @@ test('compact mobile last page does not reserve space for fuller pages', async (
         [1, 2, 3, 4],
     );
     view.app.unmount();
+});
+
+test('upcoming compact controls keep variable-height pages stable on every screen', async () => {
+    for (const desktop of [false, true]) {
+        const view = mount([1, 2, 3, 4], false, {
+            heights: [180, 100, 160, 80],
+            desktop,
+            compactMobile: true,
+            compactControls: true,
+            stableLayout: true,
+        });
+        await settle();
+        const height = view.viewport().props.style.height;
+        assert.equal(view.buttons().length, 2);
+        assert.match(view.buttons()[0].props.class, /touch-manipulation/);
+        assert.match(view.buttons()[0].props.class, /size-11/);
+        view.buttons().at(-1).props.onClick();
+        await settle();
+        assert.equal(view.viewport().props.style.height, height);
+        assert.equal(view.viewport().lastScroll.left, 400);
+        view.viewport().scrollLeft = 400;
+        view.viewport().props.onScrollPassive();
+        await settle();
+        assert.equal(view.viewport().props.style.height, height);
+        view.app.unmount();
+    }
 });

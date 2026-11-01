@@ -320,3 +320,59 @@ test('both payment forms require an explicit mode and keep the new payment separ
 
     assert.equal(paymentStateLabel('partial'), 'Parzialmente pagata');
 });
+
+test('upcoming events distinguish already recorded debits from amounts still payable', () => {
+    const page = source('resources/js/pages/dashboard/Analysis.vue');
+    const statusFunction = page.slice(
+        page.indexOf('function pendingEventStatus('),
+        page.indexOf('function pendingEventStatusClass('),
+    );
+    const getStatus = new Function(
+        ts.transpile(statusFunction + '\nreturn pendingEventStatus;', {
+            target: ts.ScriptTarget.ES2022,
+        }),
+    )();
+    assert.equal(
+        getStatus({
+            requires_payment_confirmation: true,
+            payment_management: {
+                state: 'to_verify',
+                paid_amount: 15,
+                remaining_amount: 0,
+            },
+        }),
+        'In attesa di conferma',
+    );
+    assert.equal(
+        getStatus({
+            requires_payment_confirmation: true,
+            payment_management: {
+                state: 'partial',
+                paid_amount: 10,
+                remaining_amount: 5,
+            },
+        }),
+        'Parzialmente pagato',
+    );
+    assert.equal(
+        getStatus({
+            payment_management: {
+                state: 'review',
+                paid_amount: 15,
+                remaining_amount: 0,
+            },
+        }),
+        'Da verificare',
+    );
+    assert.equal(
+        getStatus({
+            payment_management: { state: 'paid', remaining_amount: 0 },
+        }),
+        'Pagato',
+    );
+    assert.match(
+        page,
+        /Addebito già contabilizzato: conferma l’esito senza effettuare un nuovo pagamento\./,
+    );
+    assert.match(page, /L’importo mostrato è il solo residuo da pagare\./);
+});

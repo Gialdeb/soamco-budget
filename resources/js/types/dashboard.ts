@@ -480,6 +480,7 @@ export type DashboardData = {
     };
     monthly_recap: DashboardMonthlyRecap;
     pending_actions: DashboardPendingActions;
+    upcoming_events: DashboardPendingActions;
     monthly_trend: DashboardTrendPoint[];
     expense_by_category: DashboardCategoryBreakdownItem[];
     budget_vs_actual: DashboardBudgetComparisonItem[];

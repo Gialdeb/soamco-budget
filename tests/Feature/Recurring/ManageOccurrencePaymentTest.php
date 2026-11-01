@@ -188,8 +188,8 @@ it('cancels only one occurrence and records real bank reversals as review withou
         ->where('dashboard.pending_actions.items.0.amount', fn (string $amount): bool => str_contains($amount, '15,00')));
     $this->travelTo(now()->setDate(2026, 11, 9));
     app(AutomaticPaymentVerificationService::class)->confirm($transaction->fresh());
-    expect($next->fresh()->payment_management_state)->toBe('paid')
-        ->and($next->fresh()->payment_resolved_at)->not->toBeNull()
+    expect($next->fresh()->payment_management_state)->toBe('review')
+        ->and($next->fresh()->payment_resolved_at)->toBeNull()
         ->and($transaction->account->fresh()->current_balance)->toBe($balance);
 });
 
@@ -237,4 +237,149 @@ it('corrects a synthetic debit paid from another own account while preserving it
         ->and($entry->account->fresh()->current_balance)->toBe('1000.00')
         ->and($otherAccount->fresh()->current_balance)->toBe('88.00')
         ->and($occurrence->fresh()->converted_transaction_id)->toBe($transaction->id);
+});
+
+it('links an existing transaction using the frontend payment type after an explicitly confirmed automatic rectification', function (string $type) {
+    $occurrence = managedPaymentOccurrence();
+    $entry = $occurrence->recurringEntry;
+    $automatic = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user, ['automatic_posting' => true]);
+    expect($occurrence->fresh()->status->value)->toBe('completed');
+    $actual = Transaction::create([
+        'user_id' => $entry->user_id, 'account_id' => $entry->account_id, 'category_id' => $entry->category_id,
+        'transaction_date' => '2026-10-09', 'amount' => 12, 'currency' => 'EUR', 'kind' => 'manual',
+        'source_type' => 'manual', 'status' => 'confirmed', 'direction' => 'expense',
+    ]);
+    app(TransactionMutationService::class)->recalculateAccount($actual->account);
+    $before = collect($actual->fresh()->getAttributes())->except('balance_after')->all();
+    $data = [
+        'request_id' => (string) Str::uuid(), 'reason' => 'already_paid', 'action' => 'record',
+        'transaction_uuid' => $actual->uuid, 'actual_date' => '2026-10-09', 'actual_amount' => 12,
+        'payment_type' => $type, 'final_total_amount' => $type === 'final' ? 12 : null,
+        'confirm_rectification' => true,
+    ];
+    $this->actingAs($entry->user)->post(managePaymentUrl($occurrence), $data)->assertRedirect()->assertSessionHasNoErrors();
+    $this->post(managePaymentUrl($occurrence), $data)->assertRedirect()->assertSessionHasNoErrors();
+    expect(collect($actual->fresh()->getAttributes())->except('balance_after')->all())->toBe($before)
+        ->and(Transaction::count())->toBe(2)
+        ->and($automatic->fresh()->amount)->toBe('0.00')
+        ->and($actual->account->fresh()->current_balance)->toBe('988.00')
+        ->and($occurrence->paymentAllocations()->count())->toBe(1)
+        ->and($occurrence->fresh()->remainingPaymentCents())->toBe($type === 'final' ? 0 : 300)
+        ->and($occurrence->fresh()->payment_management_state)->toBe($type === 'final' ? 'paid' : 'partial')
+        ->and($occurrence->fresh()->status->value)->toBe($type === 'final' ? 'completed' : 'pending');
+    $this->get(route('dashboard', ['year' => 2026, 'month' => 10]))->assertInertia(fn ($page) => $page
+        ->where('dashboard.upcoming_events.items', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === ($type === 'advance')));
+})->with(['final', 'advance']);
+
+it('keeps a confirmed automatic advance partial without changing or duplicating its transaction', function () {
+    $occurrence = managedPaymentOccurrence();
+    $entry = $occurrence->recurringEntry;
+    $transaction = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user, ['automatic_posting' => true]);
+    $transaction->forceFill(['amount' => 10])->save();
+    app(TransactionMutationService::class)->recalculateAccount($transaction->account);
+    $this->actingAs($entry->user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))->assertInertia(fn ($page) => $page
+        ->where('dashboard.upcoming_events.items.0.requires_payment_confirmation', true)
+        ->where('dashboard.upcoming_events.items.0.can_verify_payment', true)
+        ->where('dashboard.upcoming_events.items.0.payment_management.state', 'partial')
+        ->where('dashboard.upcoming_events.items.0.payment_management.remaining_amount', 5));
+    $this->actingAs($entry->user)->post(route('transactions.payment-confirmation', $transaction->uuid))->assertRedirect()->assertSessionHasNoErrors();
+    $events = $occurrence->paymentEvents()->count();
+    $this->post(route('transactions.payment-confirmation', $transaction->uuid))->assertRedirect()->assertSessionHasNoErrors();
+    expect($occurrence->fresh()->remainingPaymentCents())->toBe(500)
+        ->and($occurrence->fresh()->payment_management_state)->toBe('partial')
+        ->and($occurrence->paymentEvents()->count())->toBe($events)
+        ->and($occurrence->fresh()->payment_resolved_at)->toBeNull()
+        ->and($transaction->fresh()->amount)->toBe('10.00')
+        ->and($transaction->account->fresh()->current_balance)->toBe('990.00')
+        ->and(Transaction::count())->toBe(1);
+});
+
+it('preserves a real review after confirming its linked automatic payment even with no residual', function () {
+    $occurrence = managedPaymentOccurrence();
+    $entry = $occurrence->recurringEntry;
+    $transaction = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user, ['automatic_posting' => true]);
+    $this->actingAs($entry->user)->post(managePaymentUrl($occurrence), [
+        'request_id' => (string) Str::uuid(), 'reason' => 'bank_reversal', 'action' => 'pending',
+    ])->assertRedirect()->assertSessionHasNoErrors();
+    $this->post(route('transactions.payment-confirmation', $transaction->uuid))->assertRedirect()->assertSessionHasNoErrors();
+    expect($occurrence->fresh()->remainingPaymentCents())->toBe(0)
+        ->and($occurrence->fresh()->payment_management_state)->toBe('review')
+        ->and($occurrence->fresh()->payment_resolved_at)->toBeNull()
+        ->and($transaction->fresh()->amount)->toBe('15.00')
+        ->and(Transaction::count())->toBe(1);
+});
+
+it('links an explicit existing final payment to a completed occurrence that still has an authoritative residual', function (bool $review) {
+    $occurrence = managedPaymentOccurrence(false);
+    $entry = $occurrence->recurringEntry;
+    $actual = Transaction::create([
+        'user_id' => $entry->user_id, 'account_id' => $entry->account_id,
+        'transaction_date' => '2026-10-09', 'amount' => 12, 'currency' => 'EUR', 'kind' => 'manual',
+        'source_type' => 'manual', 'status' => 'confirmed', 'direction' => 'expense',
+    ]);
+    $before = $actual->fresh()->getAttributes();
+    $occurrence->forceFill(['status' => 'completed', 'payment_management_state' => $review ? 'review' : null])->save();
+    expect($occurrence->remainingPaymentCents())->toBe(1500);
+    $data = [
+        'request_id' => (string) Str::uuid(), 'reason' => 'already_paid', 'action' => 'record',
+        'transaction_uuid' => $actual->uuid, 'actual_date' => '2026-10-09', 'actual_amount' => 12,
+        'payment_type' => 'final', 'final_total_amount' => 12,
+    ];
+    $this->actingAs($entry->user)->post(managePaymentUrl($occurrence), $data)->assertRedirect()->assertSessionHasNoErrors();
+    $this->post(managePaymentUrl($occurrence), $data)->assertRedirect()->assertSessionHasNoErrors();
+    expect($actual->fresh()->getAttributes())->toBe($before)
+        ->and(Transaction::count())->toBe(1)
+        ->and($occurrence->fresh()->remainingPaymentCents())->toBe(0)
+        ->and($occurrence->fresh()->payment_management_state)->toBe($review ? 'review' : 'paid')
+        ->and($occurrence->paymentAllocations()->count())->toBe(1);
+})->with([false, true]);
+
+it('presents an explicitly linked settled payment as paid even when its stored management label is stale', function () {
+    $occurrence = managedPaymentOccurrence(false);
+    $entry = $occurrence->recurringEntry;
+    $transaction = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user);
+    $occurrence->forceFill(['payment_management_state' => 'pending', 'payment_resolved_at' => null])->save();
+    $before = $transaction->fresh()->getAttributes();
+    $presentation = app(ManageOccurrencePaymentService::class)->presentation($occurrence->fresh(), $entry->user);
+    expect($presentation['state'])->toBe('paid')
+        ->and($presentation['remaining_amount'])->toEqual(0)
+        ->and($presentation['has_automatic_transaction'])->toBeFalse()
+        ->and($transaction->fresh()->getAttributes())->toBe($before);
+    $this->actingAs($entry->user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))->assertInertia(fn ($page) => $page
+        ->where('dashboard.upcoming_events.items', fn ($items): bool => ! collect($items)->contains('id', 'recurring-'.$occurrence->id)));
+});
+
+it('keeps an unverified automatic posting in the dashboard as awaiting confirmation without enabling another payment', function () {
+    $occurrence = managedPaymentOccurrence();
+    $entry = $occurrence->recurringEntry;
+    $transaction = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user, ['automatic_posting' => true]);
+    $before = $transaction->fresh()->getAttributes();
+    $this->actingAs($entry->user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))->assertInertia(fn ($page) => $page
+        ->where('dashboard.upcoming_events.items.0.requires_payment_confirmation', true)
+        ->where('dashboard.upcoming_events.items.0.payment_management.state', 'to_verify')
+        ->where('dashboard.upcoming_events.items.0.payment_management.remaining_amount', 0)
+        ->missing('dashboard.upcoming_events.items.0.can_confirm_manual'));
+    expect($transaction->fresh()->getAttributes())->toBe($before)->and(Transaction::count())->toBe(1);
+});
+
+it('repairs a stale paid confirmation when the authoritative residual has become positive', function () {
+    $occurrence = managedPaymentOccurrence();
+    $entry = $occurrence->recurringEntry;
+    $transaction = app(RecurringEntryPostingService::class)->post($occurrence, $entry->user, ['automatic_posting' => true]);
+    $transaction->forceFill(['amount' => 10, 'payment_verified_at' => now(), 'payment_verification_method' => 'manual'])->save();
+    $occurrence->forceFill(['payment_management_state' => 'paid', 'payment_resolved_at' => now()])->save();
+    $this->actingAs($entry->user)->post(route('transactions.payment-confirmation', $transaction->uuid))->assertRedirect()->assertSessionHasNoErrors();
+    expect($occurrence->fresh()->remainingPaymentCents())->toBe(500)
+        ->and($occurrence->fresh()->payment_management_state)->toBe('partial')
+        ->and($occurrence->fresh()->payment_resolved_at)->toBeNull()
+        ->and(Transaction::count())->toBe(1);
+});
+
+it('never presents an unpaid residual as paid because of a stale stored label', function () {
+    $occurrence = managedPaymentOccurrence(false);
+    $occurrence->forceFill(['payment_management_state' => 'paid'])->save();
+    $presentation = app(ManageOccurrencePaymentService::class)->presentation($occurrence, $occurrence->recurringEntry->user);
+    expect($presentation['state'])->toBe('pending')
+        ->and($presentation['remaining_amount'])->toEqual(15)
+        ->and(Transaction::count())->toBe(0);
 });

@@ -2325,17 +2325,20 @@ test('dashboard upcoming events use the canonical residual for every recurring s
             'entry_date' => '2026-10-13', 'title' => $entry->title, 'currency' => 'EUR', 'total_cents' => 3200,
             'paid_by' => 'counterparty', 'my_share_cents' => 1600, 'counterparty_share_cents' => 1600, 'status' => 'recorded']);
         $occurrence->update(['status' => 'generated']);
+    } elseif ($settlement === 'review') {
+        $occurrence->update(['status' => 'completed', 'payment_management_state' => 'review']);
     } elseif ($settlement === 'completed') {
         $occurrence->update(['status' => 'completed']);
     }
-    $visible = $settlement === 'unpaid';
+    $visible = in_array($settlement, ['unpaid', 'review'], true);
     $this->actingAs($user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))->assertSuccessful()
         ->assertInertia(fn (Assert $page) => $page
-            ->where('dashboard.scheduled_summary.upcoming', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === $visible)
+            ->where('dashboard.scheduled_summary.upcoming', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === ($settlement === 'unpaid'))
             ->where('dashboard.pending_actions.items', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === $visible)
-            ->where('dashboard.recurring_summary.planned_count', $visible ? 1 : 0)
+            ->where('dashboard.upcoming_events.items', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === $visible)
+            ->where('dashboard.recurring_summary.planned_count', $settlement === 'unpaid' ? 1 : 0)
             ->where('dashboard.credits_debts.arrears', []));
-})->with(['unpaid', 'completed', 'transaction', 'allocation', 'external']);
+})->with(['unpaid', 'completed', 'transaction', 'allocation', 'external', 'review']);
 
 test('upcoming agenda excludes cancelled plans without changing their records', function (string $date, bool $automatic, string $status) {
     $this->travelTo(CarbonImmutable::parse('2026-10-13'));
@@ -2370,6 +2373,7 @@ test('upcoming agenda excludes cancelled plans without changing their records', 
     $this->actingAs($user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))
         ->assertSuccessful()
         ->assertInertia(fn (Assert $page) => $page
+            ->where('dashboard.upcoming_events.items', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === ($status !== 'cancelled' && $date >= '2026-10-13' && $date <= '2026-10-16'))
             ->where('dashboard.pending_actions.total_count', $status === 'cancelled' ? 0 : 1)
             ->where('dashboard.pending_actions.items', fn ($items): bool => collect($items)->contains('id', 'recurring-'.$occurrence->id) === ($status !== 'cancelled')));
 
@@ -2383,6 +2387,7 @@ test('upcoming agenda excludes cancelled plans without changing their records', 
     'overdue active' => ['2026-09-10', false, 'active'],
     'future active' => ['2026-10-14', false, 'active'],
     'automatic active' => ['2026-10-10', true, 'active'],
+    'automatic today' => ['2026-10-13', true, 'active'],
 ]);
 
 test('dashboard agenda returns all scheduled items for client pagination', function () {
@@ -2399,4 +2404,52 @@ test('dashboard agenda returns all scheduled items for client pagination', funct
         ->assertInertia(fn (Assert $page) => $page
             ->where('dashboard.pending_actions.total_count', 8)
             ->where('dashboard.pending_actions.items', fn ($rows): bool => collect($rows)->pluck('id')->all() === $items->map(fn (ScheduledEntry $item): string => 'scheduled-'.$item->id)->all()));
+});
+
+test('upcoming widget uses today through day three across year boundaries and preserves arrears', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-12-30 12:00:00'));
+    $user = User::factory()->create();
+    $account = seedDashboardFixture($user);
+    $entry = RecurringEntry::create([
+        'user_id' => $user->id, 'account_id' => $account->id,
+        'title' => 'Window test', 'direction' => 'expense', 'currency' => 'EUR', 'entry_type' => 'recurring',
+        'status' => 'active', 'is_active' => true, 'start_date' => '2026-12-01',
+        'recurrence_type' => 'monthly', 'recurrence_interval' => 1, 'end_mode' => 'never',
+        'expected_amount' => 32, 'is_amount_variable' => false, 'auto_create_transaction' => false,
+        'auto_generate_occurrences' => false,
+    ]);
+    $ids = [];
+    foreach ([-1, 0, 1, 2, 3, 4] as $offset) {
+        $date = CarbonImmutable::today()->addDays($offset)->toDateString();
+        $occurrence = $entry->occurrences()->create([
+            'sequence_number' => $offset + 2, 'expected_date' => $date,
+            'due_date' => $date, 'expected_amount' => 32, 'status' => 'pending',
+        ]);
+        $ids[$offset] = 'recurring-'.$occurrence->id;
+    }
+    $this->actingAs($user)->get(route('dashboard', ['year' => 2026, 'month' => 12]))
+        ->assertSuccessful()->assertInertia(fn (Assert $page) => $page
+        ->where('dashboard.upcoming_events.items', fn ($items): bool => collect($items)->pluck('id')->sort()->values()->all() === collect($ids)->only([0, 1, 2, 3])->sort()->values()->all())
+        ->where('dashboard.pending_actions.items', fn ($items): bool => collect($items)->contains('id', $ids[-1])));
+    expect($entry->occurrences()->count())->toBe(6);
+});
+
+test('upcoming widget filters scheduled statuses across month boundaries', function () {
+    $this->travelTo(CarbonImmutable::parse('2026-10-30 12:00:00'));
+    $user = User::factory()->create();
+    $account = seedDashboardFixture($user);
+    $expected = [];
+    foreach (['planned', 'due', 'cancelled', 'converted'] as $status) {
+        $entry = ScheduledEntry::create([
+            'user_id' => $user->id, 'account_id' => $account->id,
+            'title' => $status, 'direction' => 'expense', 'currency' => 'EUR',
+            'expected_amount' => 32, 'scheduled_date' => '2026-11-02', 'status' => $status,
+        ]);
+        if (in_array($status, ['planned', 'due'], true)) {
+            $expected[] = 'scheduled-'.$entry->id;
+        }
+    }
+    $this->actingAs($user)->get(route('dashboard', ['year' => 2026, 'month' => 10]))
+        ->assertSuccessful()->assertInertia(fn (Assert $page) => $page
+        ->where('dashboard.upcoming_events.items', fn ($items): bool => collect($items)->pluck('id')->sort()->values()->all() === collect($expected)->sort()->values()->all()));
 });

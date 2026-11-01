@@ -161,7 +161,7 @@ test('analysis dashboard exposes timeline modes partial month navigation and res
     assert.match(page, /todayLabel/);
     assert.doesNotMatch(page, /openLegacy/);
     assert.doesNotMatch(page, /legacyRoute/);
-    assert.match(page, /dashboard\.pending_actions\.items/);
+    assert.match(page, /dashboard\.upcoming_events\.items/);
     assert.match(page, /<BudgetVsActual/);
     assert.match(page, /<CategoryTargets/);
     assert.match(page, /<FinancialAgenda/);

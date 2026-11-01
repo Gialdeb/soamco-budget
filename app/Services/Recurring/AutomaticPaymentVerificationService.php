@@ -20,8 +20,13 @@ class AutomaticPaymentVerificationService
             if (($occurrence->due_date ?? $occurrence->expected_date)->isFuture()) {
                 throw ValidationException::withMessages(['payment' => __('payment_management.future_confirmation')]);
             }
-            if ($current->payment_verified_at !== null && $occurrence->payment_resolved_at !== null) {
-                return;
+            if ($current->payment_verified_at !== null && $current->payment_verification_method === 'manual') {
+                $remaining = $occurrence->remainingPaymentCents();
+                $state = $occurrence->payment_management_state;
+                if (($remaining === 0 && $occurrence->payment_resolved_at !== null && in_array($state, ['paid', 'corrected'], true))
+                    || ($occurrence->payment_resolved_at === null && ($state === 'review' || ($remaining > 0 && $state === 'partial')))) {
+                    return;
+                }
             }
             app(ManageOccurrencePaymentService::class)->manage($occurrence, auth()->user() ?? $occurrence->recurringEntry->user, [
                 'request_id' => (string) Str::uuid(), 'reason' => 'already_paid', 'action' => 'confirm',

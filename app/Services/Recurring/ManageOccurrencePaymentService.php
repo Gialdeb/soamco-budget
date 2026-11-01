@@ -38,6 +38,16 @@ class ManageOccurrencePaymentService
         $read = app(RecurringOccurrenceReadService::class);
         $paid = $read->paid($occurrence);
         $remaining = $read->remaining($occurrence);
+        $state = $occurrence->payment_management_state;
+        if (! in_array($state, ['review', 'cancelled'], true)) {
+            if ($remaining === 0 && $paid > 0) {
+                $state = $automatic ? 'to_verify' : ($state === 'corrected' ? 'corrected' : 'paid');
+            } elseif ($remaining > 0 && $paid > 0) {
+                $state = 'partial';
+            } else {
+                $state = in_array($state, ['paid', 'corrected'], true) ? 'pending' : ($state ?? ($automatic ? 'to_verify' : 'pending'));
+            }
+        }
 
         return [
             'occurrence_uuid' => $occurrence->uuid, 'entry_uuid' => $entry->uuid,
@@ -51,7 +61,7 @@ class ManageOccurrencePaymentService
             'estimated_date' => $occurrence->payment_estimated_date?->toDateString(),
             'actual_amount' => $active ? (float) $transaction->amount : null,
             'actual_date' => $active ? $transaction->transaction_date->toDateString() : null,
-            'state' => $occurrence->payment_management_state ?? ($remaining > 0 && $paid > 0 ? 'partial' : ($automatic ? 'to_verify' : ($remaining === 0 && $paid > 0 ? 'paid' : 'pending'))),
+            'state' => $state,
             'has_automatic_transaction' => $automatic, 'can_rectify' => $canRectify,
             'accounts' => $includeActions ? $this->presentationAccounts($actor, $entry->currency) : [],
             'history' => ($occurrence->relationLoaded('paymentEvents') ? $occurrence->paymentEvents : $occurrence->paymentEvents()->orderBy('id')->get())->sortBy('id')->map(fn ($event): array => [
@@ -138,8 +148,16 @@ class ManageOccurrencePaymentService
                     $this->fail('no_payment');
                 }
                 $transaction->forceFill(['payment_verified_at' => $transaction->payment_verified_at ?? now(), 'payment_verification_method' => 'manual'])->saveQuietly();
-                $occurrence->forceFill(['payment_management_state' => 'paid', 'payment_resolved_at' => now(), 'payment_reminder_date' => null])->save();
+                $settled = $occurrence->remainingPaymentCents() === 0;
+                $review = $occurrence->payment_management_state === 'review';
+                $occurrence->forceFill([
+                    'payment_management_state' => $review ? 'review' : ($settled ? 'paid' : 'partial'),
+                    'payment_resolved_at' => $settled && ! $review ? now() : null,
+                    'payment_reminder_date' => $settled && ! $review ? null : $occurrence->payment_reminder_date,
+                ])->save();
+                $occurrence->synchronizeSettlementState();
             } elseif (in_array($action, ['correct', 'record'], true)) {
+                $review = $occurrence->payment_management_state === 'review';
                 if ($occurrence->status === RecurringOccurrenceStatusEnum::CANCELLED || $occurrence->matched_transaction_id !== null
                     || ($occurrence->paymentAllocations()->exists() && ! ($action === 'record' && isset($data['payment_type']))) || $occurrence->sharedExpenseLedgerEntry()->exists()
                     || $entry->shared_expense_counterparty_id !== null || $entry->salarySchedule !== null) {
@@ -168,7 +186,7 @@ class ManageOccurrencePaymentService
                 }
                 $occurrence->refresh();
                 $settled = $occurrence->remainingPaymentCents() === 0;
-                $occurrence->forceFill(['payment_management_state' => $settled ? ($action === 'correct' ? 'corrected' : 'paid') : 'partial', 'payment_resolved_at' => $settled ? now() : null, 'payment_reminder_date' => $settled ? null : $occurrence->payment_reminder_date])->save();
+                $occurrence->forceFill(['payment_management_state' => $review ? 'review' : ($settled ? ($action === 'correct' ? 'corrected' : 'paid') : 'partial'), 'payment_resolved_at' => $settled && ! $review ? now() : null, 'payment_reminder_date' => $settled && ! $review ? null : $occurrence->payment_reminder_date])->save();
             } else {
                 $this->fail('invalid');
             }
@@ -325,6 +343,9 @@ class ManageOccurrencePaymentService
             ]);
             app(TransactionMutationService::class)->recalculateAccount($account);
             app(TransactionMutationService::class)->reconcileProcessedCreditCardCyclesForTransactions([$transaction]);
+        }
+        if ($occurrence->status === RecurringOccurrenceStatusEnum::COMPLETED && $occurrence->remainingPaymentCents() > 0) {
+            $occurrence->forceFill(['status' => RecurringOccurrenceStatusEnum::PENDING])->save();
         }
         app(AllocateOccurrencePaymentService::class)->recordPayment($occurrence, $transaction, $actor, (string) $data['actual_amount'], $data['payment_type'], isset($data['final_total_amount']) ? (string) $data['final_total_amount'] : null);
 

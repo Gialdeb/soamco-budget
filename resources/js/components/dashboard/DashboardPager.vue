@@ -17,6 +17,8 @@ const props = defineProps<{
     label: string;
     fill?: boolean;
     compactMobile?: boolean;
+    compactControls?: boolean;
+    stableLayout?: boolean;
 }>();
 defineSlots<{ default(props: { item: T }): unknown }>();
 const { t } = useI18n();
@@ -78,7 +80,7 @@ const viewportHeight = computed(() => {
 
     const tallest = Math.max(
         0,
-        ...(props.compactMobile && !isDesktop.value
+        ...(props.compactMobile && !props.stableLayout && !isDesktop.value
             ? pages.value.slice(activePage.value, activePage.value + 1)
             : pages.value
         ).map(
@@ -309,12 +311,28 @@ onBeforeUnmount(() => {
                 :aria-controls="viewportId"
                 :aria-label="t('dashboard.analysis.pagination.previous')"
                 :disabled="activePage === 0"
-                class="grid size-8 shrink-0 place-items-center rounded-full hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-30"
+                class="grid shrink-0 place-items-center rounded-full hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-30"
+                :class="
+                    compactControls
+                        ? 'size-11 touch-manipulation select-none'
+                        : 'size-8'
+                "
                 @click="goToPage(activePage - 1)"
             >
                 <ChevronLeft class="size-4" aria-hidden="true" />
             </button>
-            <div class="flex min-w-0 flex-wrap justify-center">
+            <span
+                v-if="compactControls"
+                class="min-w-0 text-center text-sm tabular-nums"
+            >
+                {{
+                    t('dashboard.analysis.pagination.page', {
+                        page: activePage + 1,
+                        total: pages.length,
+                    })
+                }}
+            </span>
+            <div v-else class="flex min-w-0 flex-wrap justify-center">
                 <button
                     v-for="(_, index) in pages"
                     :key="index"
@@ -346,7 +364,12 @@ onBeforeUnmount(() => {
                 :aria-controls="viewportId"
                 :aria-label="t('dashboard.analysis.pagination.next')"
                 :disabled="activePage === pages.length - 1"
-                class="grid size-8 shrink-0 place-items-center rounded-full hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-30"
+                class="grid shrink-0 place-items-center rounded-full hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-30"
+                :class="
+                    compactControls
+                        ? 'size-11 touch-manipulation select-none'
+                        : 'size-8'
+                "
                 @click="goToPage(activePage + 1)"
             >
                 <ChevronRight class="size-4" aria-hidden="true" />

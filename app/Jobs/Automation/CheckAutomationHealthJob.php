@@ -63,6 +63,8 @@ class CheckAutomationHealthJob implements ShouldQueue
      */
     protected function runChecks(AutomationAlertService $alertService): array
     {
+        app(AutomationPipelineRunner::class)->reconcileExpiredFullBackups();
+
         $pipelines = config('automation.pipelines', []);
         $staleRunningMinutes = (int) config('automation.health.running_stale_after_minutes', 30);
         $checkedPipelines = 0;

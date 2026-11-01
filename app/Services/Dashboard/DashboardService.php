@@ -61,6 +61,7 @@ class DashboardService
                 'overview' => $this->getOverview($user, $year, $month, $accountContext),
                 'credits_debts' => $this->getCreditsDebtsSummary($user, $accountContext),
                 'pending_actions' => $this->getPendingActions($user, $year, $month, $accountContext),
+                'upcoming_events' => $this->getPendingActions($user, $year, $month, $accountContext, true),
                 'monthly_trend' => $this->getMonthlyTrend($year, $month, $accountContext),
                 'expense_by_category' => $this->getExpenseByCategory($year, $month, $accountContext),
                 'budget_vs_actual' => $this->getBudgetVsActual($year, $month, $accountContext),
@@ -217,7 +218,7 @@ class DashboardService
         ];
     }
 
-    protected function getPendingActions(User $user, int $year, ?int $month, array $accountContext): array
+    protected function getPendingActions(User $user, int $year, ?int $month, array $accountContext, bool $upcomingOnly = false): array
     {
         $today = CarbonImmutable::today();
 
@@ -236,7 +237,9 @@ class DashboardService
                 'id' => 'recurring-'.$transaction->recurring_entry_occurrence_id,
                 'title' => $transaction->description,
                 'logo_url' => $transaction->recurringOccurrence->recurringEntry->trackedItem?->logoUrl(),
-                'date' => $transaction->transaction_date->toDateString(),
+                'date' => $upcomingOnly
+                    ? ($transaction->recurringOccurrence->due_date ?? $transaction->recurringOccurrence->expected_date)->toDateString()
+                    : $transaction->transaction_date->toDateString(),
                 'amount' => (float) $transaction->amount,
                 'currency' => $transaction->currency,
                 'is_future' => false,
@@ -264,7 +267,12 @@ class DashboardService
                     ->where('status', '!=', RecurringEntryStatusEnum::CANCELLED->value);
                 $this->applyTrackedItemOwnershipConstraintForOwners($query, 'recurring_entries.tracked_item_id', $accountContext['owner_ids']);
             })
-            ->where(function (Builder $query) use ($year, $month, $today): void {
+            ->where(function (Builder $query) use ($year, $month, $today, $upcomingOnly): void {
+                if ($upcomingOnly) {
+                    $query->whereRaw('DATE(COALESCE(due_date, expected_date)) BETWEEN ? AND ?', [$today->toDateString(), $today->addDays(3)->toDateString()]);
+
+                    return;
+                }
                 $query->where(fn (Builder $period) => $period->whereYear('expected_date', $year)->when($month !== null, fn (Builder $period) => $period->whereMonth('expected_date', $month)))
                     ->orWhereDate('expected_date', '<=', $today)
                     ->orWhere(fn (Builder $managed) => $managed->whereNotNull('payment_management_state')->whereNull('payment_resolved_at'));
@@ -334,12 +342,16 @@ class DashboardService
                 ];
             });
 
-        $scheduledItems = $this->baseScheduledPeriodQuery(
-            $accountContext['account_ids'],
-            $accountContext['owner_ids'],
-            $year,
-            $month,
-        )
+        $scheduledQuery = $upcomingOnly
+            ? ScheduledEntry::query()->whereIn('scheduled_entries.account_id', $accountContext['account_ids'])
+                ->whereDate('scheduled_date', '>=', $today)->whereDate('scheduled_date', '<=', $today->addDays(3))
+            : $this->baseScheduledPeriodQuery($accountContext['account_ids'], $accountContext['owner_ids'], $year, $month);
+
+        if ($upcomingOnly) {
+            $this->applyTrackedItemOwnershipConstraintForOwners($scheduledQuery, 'scheduled_entries.tracked_item_id', $accountContext['owner_ids']);
+        }
+
+        $scheduledItems = $scheduledQuery
             ->with(['merchant:id,name', 'trackedItem.websiteIdentity', 'category:id,name,name_is_custom,slug,foundation_key', 'account:id,uuid'])
             ->whereIn('status', [
                 ScheduledEntryStatusEnum::PLANNED->value,
@@ -369,12 +381,24 @@ class DashboardService
                 ];
             });
 
+        $recurringAgendaItems = $upcomingOnly
+            ? $paymentItems->concat($recurringItems->all())
+            : $recurringItems->concat($paymentItems->all());
+
         $items = $scheduledItems
-            ->concat($recurringItems->all())
-            ->concat($paymentItems->all())->unique('id')
+            ->concat($recurringAgendaItems->all())->unique('id')
             ->filter(fn (array $item): bool => filled($item['date']))
             ->sortBy('date')
             ->values();
+
+        if ($upcomingOnly) {
+            $items = $items->filter(fn (array $item): bool => $item['date'] >= $today->toDateString()
+                && $item['date'] <= $today->addDays(3)->toDateString()
+                && ($item['payment_management']['state'] ?? null) !== 'cancelled'
+                && (($item['requires_payment_confirmation'] ?? false)
+                    || ($item['payment_management']['state'] ?? null) === 'review'
+                    || ($item['payment_management']['remaining_amount'] ?? $item['amount']) > 0));
+        }
 
         return [
             'total_count' => $items->count(),
@@ -1951,6 +1975,11 @@ class DashboardService
                 $currency
             ),
             $dashboard['pending_actions']['items']
+        );
+
+        $dashboard['upcoming_events']['items'] = array_map(
+            fn (array $item): array => $this->withFormattedMoney($item, ['amount'], $currency),
+            $dashboard['upcoming_events']['items']
         );
 
         $dashboard['recurring_summary'] = $this->withFormattedMoney(

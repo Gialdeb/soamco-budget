@@ -2,6 +2,12 @@ import { useI18n } from 'vue-i18n';
 
 /** Copy shared by recently introduced screens and controls. */
 export const uiCopy = {
+    'In attesa di conferma': 'Awaiting confirmation',
+    'Addebito già contabilizzato da confermare. L’importo mostrato è il solo residuo da pagare.':
+        'The debit is already recorded and awaits confirmation. Only the remaining balance is shown as payable.',
+    'Addebito già contabilizzato: conferma l’esito senza effettuare un nuovo pagamento.':
+        'The debit is already recorded: confirm its outcome without making another payment.',
+    'Importo residuo ancora dovuto.': 'Remaining amount still payable.',
     'Movimento senza descrizione': 'Transaction without description',
     Risultati: 'Results',
     'Paginazione piani': 'Plan pagination',

@@ -3,9 +3,12 @@
 namespace App\Services\Automation\Backups;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Number;
 use JsonException;
+use RuntimeException;
 use ZipArchive;
 
 class FullBackupService
@@ -25,15 +28,24 @@ class FullBackupService
 
         $absolutePath = $disk->path($relativePath);
 
-        $zip = new ZipArchive;
-        $status = $zip->open($absolutePath, ZipArchive::CREATE | ZipArchive::OVERWRITE);
-
-        if ($status !== true) {
-            throw new \RuntimeException('Unable to create full backup archive.');
+        $temporaryDirectory = sys_get_temp_dir().'/full-backup-'.bin2hex(random_bytes(16));
+        if (! mkdir($temporaryDirectory, 0700)) {
+            throw new RuntimeException('Unable to create backup temporary directory.');
         }
+        $partialPath = $absolutePath.'.'.bin2hex(random_bytes(8)).'.partial';
+        $zip = new ZipArchive;
+        $opened = false;
 
         try {
-            $database = $this->exportDatabase();
+            if (is_file($absolutePath)) {
+                throw new RuntimeException('The full backup archive already exists.');
+            }
+            $status = $zip->open($partialPath, ZipArchive::CREATE | ZipArchive::EXCL);
+            if ($status !== true) {
+                throw new RuntimeException('Unable to create full backup archive.');
+            }
+            $opened = true;
+            $database = $this->exportDatabase($temporaryDirectory);
 
             $manifest = [
                 'type' => 'full_backup',
@@ -66,10 +78,14 @@ class FullBackupService
                 ],
             ];
 
-            $zip->addFromString('manifest.json', $this->encode($manifest));
+            if (! $zip->addFromString('manifest.json', $this->encode($manifest))) {
+                throw new RuntimeException('Unable to add backup manifest.');
+            }
 
-            foreach ($database as $table => $rows) {
-                $zip->addFromString("database/{$table}.json", $this->encode($rows));
+            foreach ($database as $table => $path) {
+                if (! $zip->addFile($path, "database/{$table}.json")) {
+                    throw new RuntimeException("Unable to add backup table: {$table}.");
+                }
             }
 
             $this->addDiskDirectory($zip, 'local', '', 'storage/local', [
@@ -79,8 +95,31 @@ class FullBackupService
             $this->addDiskDirectory($zip, 'public', '', 'storage/public');
             $this->addPublicAsset($zip, 'apple-touch-icon.png', 'assets/apple-touch-icon.png');
             $this->addPublicAsset($zip, 'favicon.svg', 'assets/favicon.svg');
+            $opened = false;
+            $closed = $zip->close();
+            if (! $closed) {
+                throw new RuntimeException('Unable to finalize full backup archive.');
+            }
+            if (! rename($partialPath, $absolutePath)) {
+                throw new RuntimeException('Unable to publish full backup archive.');
+            }
         } finally {
-            $zip->close();
+            try {
+                if ($opened) {
+                    $zip->unchangeAll();
+                    $zip->close();
+                }
+            } finally {
+                try {
+                    if (! File::deleteDirectory($temporaryDirectory)) {
+                        throw new RuntimeException('Unable to remove backup temporary directory.');
+                    }
+                } finally {
+                    if (is_file($partialPath) && ! unlink($partialPath)) {
+                        throw new RuntimeException('Unable to remove incomplete backup archive.');
+                    }
+                }
+            }
         }
 
         $sizeBytes = is_file($absolutePath) ? filesize($absolutePath) ?: 0 : 0;
@@ -105,19 +144,56 @@ class FullBackupService
     }
 
     /**
-     * @return array<string, array<int, array<string, mixed>>>
+     * @return array<string, string>
      */
-    protected function exportDatabase(): array
+    protected function exportDatabase(string $directory): array
     {
         $tables = [];
 
-        foreach ($this->tableNames() as $table) {
-            $tables[$table] = DB::table($table)->get()->map(
-                fn ($row): array => (array) $row
-            )->all();
+        foreach ($this->tableNames() as $index => $table) {
+            $path = $directory.'/'.$index.'.json';
+            $stream = fopen($path, 'xb');
+            if ($stream === false) {
+                throw new RuntimeException("Unable to create export for table: {$table}.");
+            }
+
+            try {
+                $this->write($stream, '[');
+                $first = true;
+                $columns = Schema::getColumnListing($table);
+                DB::table($table)->orderBy($columns[0])->chunk(500, function ($rows) use ($stream, &$first): void {
+                    foreach ($rows as $row) {
+                        $json = str_replace("\n", "\n    ", $this->encode((array) $row));
+                        $this->write($stream, ($first ? "\n" : ",\n").'    '.$json);
+                        $first = false;
+                    }
+                });
+                $this->write($stream, $first ? ']' : "\n]");
+                if (! fflush($stream)) {
+                    throw new RuntimeException("Unable to flush export for table: {$table}.");
+                }
+            } finally {
+                fclose($stream);
+            }
+
+            $tables[$table] = $path;
         }
 
         return $tables;
+    }
+
+    /** @param resource $stream */
+    protected function write($stream, string $contents): void
+    {
+        $length = strlen($contents);
+        $offset = 0;
+        while ($offset < $length) {
+            $written = fwrite($stream, substr($contents, $offset));
+            if ($written === false || $written === 0) {
+                throw new RuntimeException('Unable to write backup table export.');
+            }
+            $offset += $written;
+        }
     }
 
     /**
@@ -188,7 +264,9 @@ class FullBackupService
                 continue;
             }
 
-            $zip->addFile($filePath, $zipPrefix.'/'.ltrim($file, '/'));
+            if (! $zip->addFile($filePath, $zipPrefix.'/'.ltrim($file, '/'))) {
+                throw new RuntimeException('Unable to add backup file: '.$file);
+            }
         }
     }
 
@@ -197,7 +275,9 @@ class FullBackupService
         $path = public_path($source);
 
         if (is_file($path) && is_readable($path)) {
-            $zip->addFile($path, $target);
+            if (! $zip->addFile($path, $target)) {
+                throw new RuntimeException('Unable to add backup asset: '.$source);
+            }
         }
     }
 
@@ -209,7 +289,7 @@ class FullBackupService
     protected function ensureZipArchiveAvailable(): void
     {
         if (! class_exists(ZipArchive::class)) {
-            throw new \RuntimeException(
+            throw new RuntimeException(
                 'The PHP zip extension is required for backups. Install/enable ext-zip so ZipArchive is available.',
             );
         }

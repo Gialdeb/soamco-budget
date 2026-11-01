@@ -8,23 +8,34 @@ use App\Services\Automation\Backups\FullBackupService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Throwable;
 
 class RunFullBackupJob implements ShouldQueue
 {
     use Queueable;
 
-    public int $timeout = 600;
+    public const TIMEOUT_SECONDS = 600;
+
+    public int $timeout = self::TIMEOUT_SECONDS;
 
     public int $tries = 1;
 
+    public bool $failOnTimeout = true;
+
+    public ?string $executionId = null;
+
     public function __construct(
         public AutomationTriggerTypeEnum $triggerType = AutomationTriggerTypeEnum::SCHEDULED,
-    ) {}
+    ) {
+        $this->executionId = (string) Str::uuid();
+    }
 
     public function handle(
         AutomationPipelineRunner $runner,
         FullBackupService $fullBackupService,
     ): void {
+        $this->executionId ??= (string) Str::uuid();
         $backupDisk = (string) config('automation.backups.disk', 'local');
         $disk = Storage::disk($backupDisk);
 
@@ -51,6 +62,14 @@ class RunFullBackupJob implements ShouldQueue
                 'backup_root' => $disk->path(''),
             ],
             attempt: 1,
+            fullBackupExecutionId: $this->executionId,
         );
+    }
+
+    public function failed(?Throwable $exception): void
+    {
+        if ($this->executionId !== null) {
+            app(AutomationPipelineRunner::class)->failFullBackup($this->executionId, $exception);
+        }
     }
 }

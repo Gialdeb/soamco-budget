@@ -294,6 +294,7 @@ function pendingEventStatus(
     | 'Da verificare'
     | 'Parzialmente pagato'
     | 'In attesa'
+    | 'In attesa di conferma'
     | 'Pagato'
     | 'Previsto'
     | 'Scaduto' {
@@ -315,11 +316,11 @@ function pendingEventStatus(
         return 'Parzialmente pagato';
     }
 
-    if (
-        item.requires_payment_confirmation ||
-        payment?.state === 'to_verify' ||
-        payment?.state === 'processing'
-    ) {
+    if (item.requires_payment_confirmation || payment?.state === 'to_verify') {
+        return 'In attesa di conferma';
+    }
+
+    if (payment?.state === 'processing') {
         return 'In attesa';
     }
 
@@ -1207,13 +1208,16 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                 }}
                             </p>
                         </div>
-                        <CalendarDays class="size-5 text-muted-foreground" />
+                        <CalendarDays
+                            class="size-5 shrink-0 text-muted-foreground"
+                        />
                     </div>
                     <DashboardPager
-                        v-if="dashboard.pending_actions.items.length"
+                        v-if="dashboard.upcoming_events.items.length"
                         v-slot="{ item }"
-                        :items="dashboard.pending_actions.items"
-                        compact-mobile
+                        :items="dashboard.upcoming_events.items"
+                        stable-layout
+                        compact-controls
                         :label="t('dashboard.analysis.upcomingEvents')"
                         class="mt-4"
                     >
@@ -1232,7 +1236,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                     class="block min-w-0 flex-1 rounded-lg focus-visible:outline-2 focus-visible:outline-ring"
                                 >
                                     <div
-                                        class="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1.5"
+                                        class="grid min-w-0 grid-cols-1 items-center gap-1.5 sm:grid-cols-[minmax(0,1fr)_auto]"
                                     >
                                         <h3
                                             :title="item.title"
@@ -1245,7 +1249,15 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                             :value="
                                                 item.requires_payment_confirmation
                                                     ? formatCurrency(
-                                                          item.amount_raw,
+                                                          (item
+                                                              .payment_management
+                                                              ?.remaining_amount ??
+                                                              0) > 0
+                                                              ? (item
+                                                                    .payment_management
+                                                                    ?.remaining_amount ??
+                                                                    0)
+                                                              : item.amount_raw,
                                                           item.currency ??
                                                               currency,
                                                       )
@@ -1301,6 +1313,30 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                     {{ ui(pendingEventStatus(item)) }}
                                 </Badge>
                                 <p
+                                    v-if="item.requires_payment_confirmation"
+                                    class="basis-full text-xs text-muted-foreground"
+                                >
+                                    {{
+                                        ui(
+                                            (item.payment_management
+                                                ?.remaining_amount ?? 0) > 0
+                                                ? 'Addebito già contabilizzato da confermare. L’importo mostrato è il solo residuo da pagare.'
+                                                : 'Addebito già contabilizzato: conferma l’esito senza effettuare un nuovo pagamento.',
+                                        )
+                                    }}
+                                </p>
+                                <p
+                                    v-else-if="
+                                        (item.payment_management?.paid_amount ??
+                                            0) > 0 &&
+                                        (item.payment_management
+                                            ?.remaining_amount ?? 0) > 0
+                                    "
+                                    class="basis-full text-xs text-muted-foreground"
+                                >
+                                    {{ ui('Importo residuo ancora dovuto.') }}
+                                </p>
+                                <p
                                     v-if="
                                         !item.is_future &&
                                         item.automatic_payment_missing
@@ -1311,7 +1347,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                 </p>
                             </div>
                             <div
-                                class="mt-auto flex min-w-0 flex-wrap items-center gap-1.5 empty:hidden"
+                                class="mt-auto grid min-w-0 grid-cols-1 gap-2 empty:hidden sm:grid-cols-2"
                             >
                                 <template v-if="!item.is_future">
                                     <Button
@@ -1320,7 +1356,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                             item.can_manage
                                         "
                                         size="sm"
-                                        class="h-8 w-auto min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
+                                        class="h-auto min-h-11 w-full min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
                                         variant="outline"
                                         @click="managePayment(item)"
                                         ><Settings2 class="size-4 shrink-0" />{{
@@ -1331,7 +1367,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                 <Link
                                     v-if="item.plan_url"
                                     :href="item.plan_url"
-                                    class="inline-flex h-8 w-auto min-w-0 items-center justify-center gap-1 rounded-md border border-blue-500/20 bg-blue-500/5 px-2 py-1 text-center text-xs leading-snug font-medium whitespace-normal text-blue-700 transition-colors hover:bg-blue-500/10 focus-visible:outline-2 focus-visible:outline-ring dark:text-blue-300"
+                                    class="inline-flex h-auto min-h-11 w-full min-w-0 items-center justify-center gap-1 rounded-md border border-blue-500/20 bg-blue-500/5 px-2 py-1 text-center text-xs leading-snug font-medium whitespace-normal text-blue-700 transition-colors hover:bg-blue-500/10 focus-visible:outline-2 focus-visible:outline-ring dark:text-blue-300"
                                     ><ExternalLink
                                         class="size-3.5 shrink-0"
                                     />{{ ui('Vai al piano') }}</Link
@@ -1343,7 +1379,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                             item.transaction_uuid
                                         "
                                         size="sm"
-                                        class="h-8 w-auto min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
+                                        class="h-auto min-h-11 w-full min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
                                         :disabled="
                                             paymentVerification.processing
                                         "
@@ -1353,7 +1389,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                     <Button
                                         v-else-if="item.can_confirm_manual"
                                         size="sm"
-                                        class="h-8 w-auto min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
+                                        class="h-auto min-h-11 w-full min-w-0 justify-center gap-1 rounded-md px-2 py-1 text-xs leading-snug whitespace-normal"
                                         :disabled="
                                             manualRegistration.processing
                                         "
@@ -1368,7 +1404,7 @@ onBeforeUnmount(() => accountSelectorObserver?.disconnect());
                                         item.can_verify_payment
                                     "
                                     role="alert"
-                                    class="basis-full text-xs text-destructive"
+                                    class="text-xs text-destructive sm:col-span-2"
                                 >
                                     {{ paymentVerification.errors.payment }}
                                 </p>
